@@ -11,3 +11,128 @@ import math
 import matplotlib.pyplot as plt
 import pydicom
 from church import pipe
+
+D_center = 2.260
+u0 = 0.00633
+omega = np.array(json.load(open('../data/omegaTMR10.json'))).astype('f8')
+u = np.array(json.load(open('../data/muTMR10.json'))).astype('f8')
+scal = np.array(json.load(open('../data/dScaling.json'))).astype('f8')
+vsf = np.array(json.load(open('../data/dTMRvsf.json'))).astype('f8')
+sourceXYZ_0 = np.array(json.load(open('../data/sourceXYZ.json'))).astype('f8')
+C4_D = np.array(pd.read_csv('C:/Users/yuki-/Documents/高精度/procsv2/C4_D.csv', header=None,dtype = 'f8'))
+C4_F = np.array(pd.read_csv('C:/Users/yuki-/Documents/高精度/procsv2/C4_F.csv', header=None,dtype = 'f8'))
+C8_D = np.array(pd.read_csv('C:/Users/yuki-/Documents/高精度/procsv2/C8_D.csv', header=None,dtype = 'f8'))
+C8_F = np.array(pd.read_csv('C:/Users/yuki-/Documents/高精度/procsv2/C8_F.csv', header=None,dtype = 'f8'))
+C16_D = np.array(pd.read_csv('C:/Users/yuki-/Documents/高精度/procsv2/C16_D.csv', header=None,dtype = 'f8'))
+C16_F = np.array(pd.read_csv('C:/Users/yuki-/Documents/高精度/procsv2/C16_F.csv', header=None,dtype = 'f8'))
+scalXYZ_0 = np.array(pd.read_csv('C:/Users/yuki-/Documents/高精度/procsv2/scalxyz.csv', header=None,dtype = 'f8')).reshape(8,3,24,3)
+crossXYZ_0 = np.array(pd.read_csv('C:/Users/yuki-/Documents/高精度/crossxyz2.csv', header=None,dtype = 'f8')).reshape(8,3,24,3)
+angle = np.array(pd.read_csv('C:/Users/yuki-/Documents/高精度/angle1.csv', header=None,dtype = 'f8'))
+DD = np.concatenate([C4_D, C8_D, C16_D])
+FF = np.concatenate([C4_F, C8_F, C16_F])
+FF2 = np.load('C:/Users/yuki-/Documents/高精度/F.npy') 
+
+Profile_D = DD.reshape(3,24,164)
+Profile_F = FF.reshape(3,24,164)
+
+def get_roi_skull_index(rtss):
+    roi_seq = rtss.StructureSetROISequence
+    return list(map(attrgetter('ROIName'), roi_seq)).index('*Skull')
+def get_skull_cntr_coords(cntr_seq):#, image_position_xy):
+    cntrs = np.concatenate(list(map(ctr_strp, cntr_seq)))
+    return cntrs# - (image_position_xy + (-100,))
+ctr_strp = pipe(attrgetter('ContourData'),partial(np.fromiter, dtype='f8'),methodcaller('reshape', (-1, 3)))
+
+rtss = pydicom.read_file('C:/Users/yuki-/Documents/高精度/P355VARIMULTI/RTSS.dcm')#RTSS_path
+
+skull_index = get_roi_skull_index(rtss)
+
+cntrs = get_skull_cntr_coords(rtss.ROIContourSequence[skull_index].ContourSequence)
+#コンツールにアフィン変換適応
+cntrs1 = cntrs*[1,-1,-1]#TPS座標にY、Zを反転
+skullcnt = cntrs1+[104.53,114.02,77.9]#アフィン変換によるシフト、[100,100,100]を原点
+
+#TPSセンターは[100,100,100] sourceXYZ = sourcexyz+[isox,isoy,isoz]
+
+def dfei1(SC, iso, sourceXYZ_0):
+
+    #sourceを576行にしてiso座標にシンクロ
+    sourceXYZ1 = sourceXYZ_0.reshape(576,3)#c4sec1,c8sec1,c16sec1,c4sec2...c16sec8
+    sourceXYZ2 = sourceXYZ1 + [iso]
+    
+    iso_tile = np.tile(iso, 576).reshape(-1,3)
+    SC_tile = np.tile(SC, 576).reshape(-1,3)
+    square = np.einsum('ij,ij->i', sourceXYZ2, sourceXYZ2)
+    SCkab = np.einsum('ij,ij->i', sourceXYZ2, iso_tile)
+    SCkbc = np.einsum('ij,ij->i', iso_tile, SC_tile)
+    SCkac = np.einsum('ij,ij->i', sourceXYZ2, SC_tile)
+    BA = iso_tile - sourceXYZ2
+    kba = np.einsum('ij,ij->i', BA, BA)
+    SCkk = (square-SCkab+SCkbc-SCkac)/kba
+    SCk = SCkk.reshape(-1, 1)
+    SCH = (SCk*BA) + sourceXYZ2
+    SCCH = np.sqrt(np.einsum('ij,ij->i', SC_tile - SCH, SC_tile - SCH))
+    
+    return SCCH
+    
+    def Dfei(iso):
+    #skullcnt_shift = skullcnt+iso
+    SC = skullcnt[skullcnt[:,2]<iso[2]]#skullcntのｚ軸がiso以上の値の排除（尾側）
+    Dfei_index = np.array([dfei1(i, iso, sourceXYZ_0) for i in SC]).argmin(axis = 0)
+    Dfei = np.sqrt(np.einsum('ij,ij->i', iso-SC[Dfei_index], iso-SC[Dfei_index])).reshape(8,3,24) 
+    
+    return Dfei
+    
+    def calc_dose_rate_single(P, iso, Dfei, source, sec):#線量率計算式
+    #セクター１
+    #source1～８　sec１～８
+    sourceXYZ = sourceXYZ_0 + iso
+    scalXYZ = scalXYZ_0 + iso
+    cross = crossXYZ_0+iso
+    iso_tile = np.tile(iso, 24).reshape(-1,3)
+    P_tile = np.tile(P, 24).reshape(-1,3)
+    square = np.einsum('ij,ij->i', sourceXYZ[source,sec], sourceXYZ[source,sec])
+    kab = np.einsum('ij,ij->i', sourceXYZ[source,sec], iso_tile)
+    kbc = np.einsum('ij,ij->i', iso_tile, P_tile)
+    kac = np.einsum('ij,ij->i', sourceXYZ[source,sec], P_tile)
+    BA = iso_tile - sourceXYZ[source,sec]
+    kba = np.einsum('ij,ij->i', BA, BA)
+    kk = (square-kab+kbc-kac)/kba
+    k = kk.reshape(-1, 1)
+    H = (k*BA) + sourceXYZ[source,sec]
+    #souceからHの距離　vsf-dz
+    vsfdz = np.sqrt(np.einsum('ij,ij->i', sourceXYZ[source,sec]-H, sourceXYZ[source,sec]-H))
+    scaldz = np.sqrt(np.einsum('ij,ij->i', scalXYZ[source,sec]-H, scalXYZ[source,sec]-H))
+    s_iso = np.sqrt(np.einsum('ij,ij->i', sourceXYZ[source,sec]-iso_tile, sourceXYZ[source,sec]-iso_tile))
+    dz = s_iso-vsfdz
+    #dz = np.sqrt(np.einsum('ij,ij->i', iso_tile-H, iso_tile-H))
+    CH = np.sqrt(np.einsum('ij,ij->i', P_tile-H, P_tile-H))
+    d = (scal[sec]*CH)/(scaldz)
+    dd = d.reshape(len(d),-1)
+    index_D = (np.abs(dd-Profile_D[sec]).argmin(axis = 1)).reshape(len(dd),-1)
+#OCR改 CH cross-H
+    crossH = np.sqrt(np.einsum('ij,ij->i', cross[source,sec]-H, cross[source,sec]-H))
+    crossHPH = np.einsum('ij,ij->i', cross[source,sec]-H, P_tile-H)
+    #abac = np.einsum('ij,ij->i', Hcross, HP)
+    cos = crossHPH/((CH)*(crossH))
+    #cos = abac/(ab*ac)
+    rad = np.arccos(cos)
+    theta =((rad *180/np.pi)+90).reshape(len(rad),-1)#thetaは0度から180°　theta＋90度でprofileにあう
+    index_angle =  (np.abs(theta-angle).argmin(axis = 1)).reshape(len(theta),-1)
+  
+    ocr_map = np.array(list(map(lambda i: FF2[sec][i,index_angle[i],index_D[i]], range(len(index_D))))).ravel()    
+    
+    #Di = (sum(D_center*omega[sec]*(1 / (1 - dz / vsf[sec]))**2*np.exp(u[sec]*dz)*np.exp(u0*(80-Dfei[source,sec]))*ocr_map))/180.496
+    Di = (sum(D_center*omega[sec]*(vsf[sec] / (vsfdz))**2*np.exp(u[sec]*dz)*np.exp(-u0*(Dfei[source,sec]-80))*ocr_map))/180.496
+    return Di
+
+def calc_dose_rate_single2(P, iso, Dfei, source, sec):#中心線量率（1shot、１point）
+    Dii = sum(list(map(partial(calc_dose_rate_single,P, iso, Dfei), source, sec)))
+    
+    return Dii
+
+
+def calc_dose_rate_single3(Pm, Dfei, source,iso, sec):#範囲-a～a、間隔intervalの1shot、複数point
+    
+    Diii = np.array(list(map(partial(calc_dose_rate_single2, iso=iso, Dfei=Dfei, source=source, sec=sec),Pm)))
+    return Diii
